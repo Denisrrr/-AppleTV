@@ -1,115 +1,200 @@
-import random
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 import sqlite3
-from flask import Flask, render_template_string
-from ping3 import ping
+import os
+import threading
+import time
+import subprocess
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Инициализация Flask-приложения
 app = Flask(__name__)
-
-# Создаем или подключаемся к базе данных
-conn = sqlite3.connect('devices_status.db', check_same_thread=False)
-cursor = conn.cursor()
-
-# Создание таблицы для хранения IP-адресов и статусов, если её нет
-cursor.execute('''CREATE TABLE IF NOT EXISTS devices
-                  (id INTEGER PRIMARY KEY, address TEXT, status TEXT)''')
+app.secret_key = 'your_secret_key_here'  # Установите секретный ключ для управления сессиями
 
 
-# Генерация случайных IP-адресов и их добавление в базу данных
-def generate_random_ip():
-    return f"192.168.{random.randint(0, 255)}.{random.randint(1, 255)}"
+# Класс для работы с устройствами
+class DeviceMonitor:
+    def __init__(self, db_name):
+        self.db_name = db_name
+        self.notifications = []  # Храним уведомления в памяти
+        self.initialize_database()
+
+    def initialize_database(self):
+        connection = sqlite3.connect(self.db_name)
+        cursor = connection.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+        """)
+        connection.commit()
+        connection.close()
+
+    def add_device(self, ip_address):
+        connection = sqlite3.connect(self.db_name)
+        cursor = connection.cursor()
+        cursor.execute("INSERT INTO devices (ip_address, status) VALUES (?, ?)", (ip_address, "Unknown"))
+        connection.commit()
+        connection.close()
+
+    def delete_device(self, device_id):
+        connection = sqlite3.connect(self.db_name)
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+        connection.commit()
+        connection.close()
+
+    def update_device_status(self, ip_address, new_status):
+        connection = sqlite3.connect(self.db_name)
+        cursor = connection.cursor()
+        cursor.execute("SELECT status FROM devices WHERE ip_address = ?", (ip_address,))
+        result = cursor.fetchone()
+        if result and result[0] != new_status:  # Если статус изменился
+            cursor.execute("UPDATE devices SET status = ? WHERE ip_address = ?", (new_status, ip_address))
+            connection.commit()
+            connection.close()
+            self.notifications.append(f"Device {ip_address} status changed to {new_status}.")
+            return True
+        connection.close()
+        return False
+
+    def get_devices(self):
+        connection = sqlite3.connect(self.db_name)
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM devices")
+        devices = cursor.fetchall()
+        connection.close()
+        return devices
+
+    def get_notifications(self):
+        notifications = self.notifications[:]
+        self.notifications.clear()  # Очищаем список уведомлений после передачи
+        return notifications
 
 
-def populate_db_with_random_ips(num_ips=5):
-    for _ in range(num_ips):
-        address = generate_random_ip()
-        cursor.execute("INSERT INTO devices (address, status) VALUES (?, ?)", (address, "Unknown"))
-    conn.commit()
+# Инициализация системы устройств
+device_monitor = DeviceMonitor("devices.db")
 
 
-# Функция для пинга устройств и обновления статусов
-def ping_devices():
-    cursor.execute("SELECT id, address FROM devices")
-    devices = cursor.fetchall()
-
-    for device in devices:
-        device_id, address = device
-        response_time = ping(address)
-        status = "Available" if response_time else "Unavailable"
-        cursor.execute("UPDATE devices SET status=? WHERE id=?", (status, device_id))
-
-    conn.commit()
+# Уведомления
+@app.route('/notifications', methods=['GET'])
+def get_notifications():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    notifications = device_monitor.get_notifications()
+    return jsonify(notifications)
 
 
-# HTML-шаблон для отображения данных
-html_template = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Device Status</title>
-    <style>
-        table {
-            width: 50%;
-            border-collapse: collapse;
-            margin: 25px 0;
-            font-size: 18px;
-            text-align: left;
-        }
-        th, td {
-            padding: 12px;
-            border: 1px solid #ddd;
-        }
-        th {
-            background-color: #f2f2f2;
-        }
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-    </style>
-</head>
-<body>
-    <h1>Device Status</h1>
-    <table>
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>IP Address</th>
-                <th>Status</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for device in devices %}
-            <tr>
-                <td>{{ device[0] }}</td>
-                <td>{{ device[1] }}</td>
-                <td>{{ device[2] }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-</body>
-</html>
-"""
+# Устройства
+@app.route('/devices', methods=['GET'])
+def get_devices():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    devices = device_monitor.get_devices()
+    return jsonify(devices)
 
 
-# Главная страница, на которой будут отображены результаты пинга
+@app.route('/add_device', methods=['POST'])
+def add_device():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    data = request.json
+    ip_address = data.get('ip_address')
+    if ip_address:
+        device_monitor.add_device(ip_address)
+        return jsonify({'message': f'Device {ip_address} added successfully!'}), 201
+    return jsonify({'error': 'IP address is required!'}), 400
+
+
+@app.route('/delete_device', methods=['POST'])
+def delete_device():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    data = request.json
+    device_id = data.get('device_id')
+    if device_id:
+        device_monitor.delete_device(device_id)
+        return jsonify({'message': f'Device with ID {device_id} deleted successfully!'}), 200
+    return jsonify({'error': 'Device ID is required!'}), 400
+
+
+# Регистрация
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        hashed_password = generate_password_hash(password)
+        connection = sqlite3.connect("devices.db")
+        cursor = connection.cursor()
+        try:
+            cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_password))
+            connection.commit()
+            connection.close()
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            connection.close()
+            return "User already exists."
+    return render_template('register.html')
+
+
+# Авторизация
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        connection = sqlite3.connect("devices.db")
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        connection.close()
+        if user and check_password_hash(user[2], password):
+            session['user_id'] = user[0]
+            return redirect(url_for('index'))
+        return "Invalid credentials."
+    return render_template('login.html')
+
+
+# Выход из аккаунта
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    return redirect(url_for('login'))
+
+
+# Главная страница
 @app.route('/')
 def index():
-    ping_devices()  # Пингуем устройства перед показом страницы
-    cursor.execute("SELECT * FROM devices")
-    devices = cursor.fetchall()
-    return render_template_string(html_template, devices=devices)
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template('index.html')
+
+
+# Функция для мониторинга устройств
+def monitor_devices():
+    while True:
+        devices = device_monitor.get_devices()
+        for device in devices:
+            ip_address = device[1]
+            new_status = ping_device(ip_address)
+            device_monitor.update_device_status(ip_address, new_status)
+        time.sleep(5)
+
+
+# Пинг устройств
+def ping_device(ip_address):
+    try:
+        result = subprocess.run(['ping', '-c', '1', ip_address] if os.name != 'nt' else ['ping', '-n', '1', ip_address],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return "Available" if result.returncode == 0 else "Unavailable"
+    except Exception:
+        return "Unavailable"
+
+
+# Запускаем мониторинг устройств в отдельном потоке
+threading.Thread(target=monitor_devices, daemon=True).start()
 
 
 if __name__ == '__main__':
-    # Заполняем базу данных случайными IP-адресами, если таблица пуста
-    cursor.execute("SELECT COUNT(*) FROM devices")
-    if cursor.fetchone()[0] == 0:
-        populate_db_with_random_ips(10)
-
-    # Запускаем Flask веб-сервер
-    if __name__ == '__main__':
-        app.run(debug=False)
-
+    app.run()
